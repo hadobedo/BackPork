@@ -58,6 +58,7 @@ typedef struct active_fakelib_mount {
     bool valid;
     bool mounted;
     bool unmounted_for_rest;
+    bool terminated_for_rest;
     pid_t pid;
     char title_id[10];
     char sandbox_id[14];
@@ -180,59 +181,19 @@ static void unmount_active_fakelib_for_rest(unsigned state) {
             g_active_mount.mount_path, err, strerror(err));
 }
 
-static void remount_active_fakelib_after_wake(unsigned previous_state) {
-    if (!g_active_mount.valid || g_active_mount.mounted ||
-        !g_active_mount.unmounted_for_rest ||
-        g_active_mount.mount_path[0] == '\0' ||
-        g_active_mount.sandbox_id[0] == '\0') {
-        return;
-    }
-
-    if (!is_process_alive(g_active_mount.pid)) {
-        log_msg("[POWER] skipping wake remount because active game is gone: pid=%d title=%s\n",
-                (int)g_active_mount.pid, g_active_mount.title_id);
-        return;
-    }
-
-    char fake_path[PATH_MAX + 1];
-    snprintf(fake_path, sizeof(fake_path), "/mnt/sandbox/%s/app0/fakelib",
-             g_active_mount.sandbox_id);
-
-    log_msg("[POWER] remounting fakelib after wake from state %u: pid=%d title=%s sandbox=%s src=%s dst=%s\n",
-            previous_state, (int)g_active_mount.pid, g_active_mount.title_id,
-            g_active_mount.sandbox_id, fake_path, g_active_mount.mount_path);
-
-    struct iovec iov[] = {
-        IOVEC_ENTRY("fstype"),
-        IOVEC_ENTRY("unionfs"),
-        IOVEC_ENTRY("from"),
-        IOVEC_ENTRY(fake_path),
-        IOVEC_ENTRY("fspath"),
-        IOVEC_ENTRY(g_active_mount.mount_path),
-    };
-
-    int ret = nmount(iov, IOVEC_SIZE(iov), 0);
-    if (ret == 0) {
-        g_active_mount.mounted = true;
-        g_active_mount.unmounted_for_rest = false;
-        log_msg("[POWER] fakelib remounted after wake: %s\n",
-                g_active_mount.mount_path);
-        return;
-    }
-
-    int err = errno;
-    log_msg("[WARNING] fakelib wake remount failed: src=%s dst=%s errno=%d %s\n",
-            fake_path, g_active_mount.mount_path, err, strerror(err));
-}
-
 static void terminate_active_game_for_rest(unsigned state) {
     if (!g_active_mount.valid || g_active_mount.pid <= 0) {
+        return;
+    }
+
+    if (g_active_mount.terminated_for_rest) {
         return;
     }
 
     if (!is_process_alive(g_active_mount.pid)) {
         log_msg("[POWER] active game already gone before rest termination: pid=%d title=%s\n",
                 (int)g_active_mount.pid, g_active_mount.title_id);
+        g_active_mount.terminated_for_rest = true;
         return;
     }
 
@@ -243,6 +204,7 @@ static void terminate_active_game_for_rest(unsigned state) {
         log_msg("[WARNING] failed to terminate active game before rest: pid=%d errno=%d %s\n",
                 (int)g_active_mount.pid, errno, strerror(errno));
     }
+    g_active_mount.terminated_for_rest = true;
 }
 
 static bool is_rest_state(unsigned state) {
@@ -283,7 +245,9 @@ static void apply_system_state(unsigned state) {
     }
 
     if (state == SYSTEM_STATE_WORKING && g_power_paused) {
-        remount_active_fakelib_after_wake(previous_state);
+        if (g_active_mount.terminated_for_rest) {
+            log_msg("[POWER] active game was terminated for rest; skipping wake remount\n");
+        }
         g_power_paused = false;
         g_last_resume_us = monotonic_time_us();
         log_msg("[POWER] resumed from system state %u, settling for %u ms\n",
