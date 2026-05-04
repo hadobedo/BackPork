@@ -28,6 +28,8 @@
 #define SHELLCORE_FLAG_ALL_BITS UINT64_MAX
 #define RESUME_SETTLE_US 2000000ull
 #define REST_POLL_US 250000u
+#define GAME_SCAN_US 1000000ull
+#define HEARTBEAT_US 5000000ull
 
 typedef intptr_t backpork_event_flag_t;
 
@@ -339,6 +341,70 @@ static pid_t find_pid(const char *name) {
     free(buf);
 
     return pid;
+}
+
+static bool get_game_title_id(pid_t pid, char *title_id, size_t title_id_size) {
+    app_info_t appinfo = {0};
+    int rc = sceKernelGetAppInfo(pid, &appinfo);
+    if (rc != 0) {
+        return false;
+    }
+
+    if (title_id_size < 10) {
+        return false;
+    }
+
+    memset(title_id, 0, title_id_size);
+    memcpy(title_id, appinfo.title_id, 9);
+    return strncmp(title_id, "PPSA", 4) == 0 || strncmp(title_id, "CUSA", 4) == 0;
+}
+
+static bool find_running_game(pid_t *game_pid, char *title_id,
+                              size_t title_id_size) {
+    int mib[4] = {1, 14, 8, 0};
+    pid_t mypid = getpid();
+    size_t buf_size;
+    uint8_t *buf;
+
+    if (sysctl(mib, 4, 0, &buf_size, 0, 0)) {
+        log_msg("[SCAN] sysctl size failed: %s\n", strerror(errno));
+        return false;
+    }
+
+    if (!(buf = malloc(buf_size))) {
+        log_msg("[SCAN] malloc failed for process scan size=%zu\n", buf_size);
+        return false;
+    }
+
+    if (sysctl(mib, 4, buf, &buf_size, 0, 0)) {
+        log_msg("[SCAN] sysctl read failed: %s\n", strerror(errno));
+        free(buf);
+        return false;
+    }
+
+    bool found = false;
+    for (uint8_t *ptr = buf; ptr < (buf + buf_size);) {
+        int ki_structsize = *(int *)ptr;
+        pid_t ki_pid = *(pid_t *)&ptr[72];
+        ptr += ki_structsize;
+
+        if (ki_pid == mypid || ki_pid <= 0) {
+            continue;
+        }
+
+        if (g_active_mount.valid && g_active_mount.pid == ki_pid) {
+            continue;
+        }
+
+        if (get_game_title_id(ki_pid, title_id, title_id_size)) {
+            *game_pid = ki_pid;
+            found = true;
+            break;
+        }
+    }
+
+    free(buf);
+    return found;
 }
 
 static int cleanup_directory(const char *path) {
@@ -805,12 +871,37 @@ int main() {
     log_msg("[INFO] Monitoring SceSysCore.elf (pid %d) for game launches...\n", syscore_pid);
 
     pid_t child_pid = -1;
+    uint64_t last_scan_us = 0;
+    uint64_t last_heartbeat_us = 0;
 
     while (!g_stop_requested) {
         poll_power_state();
         if (should_defer_mount_work()) {
             usleep(REST_POLL_US);
             continue;
+        }
+
+        uint64_t now_us = monotonic_time_us();
+        if (now_us != 0 && now_us - last_heartbeat_us >= HEARTBEAT_US) {
+            log_msg("[LOOP] alive child_pid=%d state=%u paused=%d active_valid=%d active_mounted=%d\n",
+                    (int)child_pid, g_last_system_state, g_power_paused ? 1 : 0,
+                    g_active_mount.valid ? 1 : 0, g_active_mount.mounted ? 1 : 0);
+            last_heartbeat_us = now_us;
+        }
+
+        if (now_us != 0 && now_us - last_scan_us >= GAME_SCAN_US &&
+            !g_active_mount.valid) {
+            pid_t scan_pid = -1;
+            char scan_title_id[10] = {0};
+            if (find_running_game(&scan_pid, scan_title_id, sizeof(scan_title_id))) {
+                log_msg("[SCAN] running game detected pid=%d title=%s\n",
+                        (int)scan_pid, scan_title_id);
+                patch_game(scan_pid, scan_title_id);
+                child_pid = -1;
+                last_scan_us = monotonic_time_us();
+                continue;
+            }
+            last_scan_us = now_us;
         }
 
         struct kevent event;
@@ -824,27 +915,27 @@ int main() {
 
         if (nev == 0) continue;
 
+        log_msg("[EVENT] ident=%d filter=%d flags=0x%04X fflags=0x%08X child_pid=%d\n",
+                (int)event.ident, event.filter, event.flags, event.fflags,
+                (int)child_pid);
+
         if (event.fflags & NOTE_CHILD) {
             child_pid = event.ident;
+            log_msg("[EVENT] NOTE_CHILD child_pid=%d\n", (int)child_pid);
         }
 
         if (event.fflags & NOTE_EXEC && child_pid != -1 && event.ident == child_pid) {
-            app_info_t appinfo = {0};
-            if (sceKernelGetAppInfo(child_pid, &appinfo) != 0) {
-                child_pid = -1;
-                continue;
-            }
-
             char title_id[10] = {0};
-            memcpy(title_id, appinfo.title_id, 9);
-
-            // Check if it's a PPSA/CUSA game
-            if (strncmp(title_id, "PPSA", 4) != 0 && strncmp(title_id, "CUSA", 4) != 0) {
+            if (!get_game_title_id(child_pid, title_id, sizeof(title_id))) {
+                log_msg("[EVENT] NOTE_EXEC ignored pid=%d no PPSA/CUSA title\n",
+                        (int)child_pid);
                 child_pid = -1;
                 continue;
             }
 
             if (wait_until_work_ready()) {
+                log_msg("[EVENT] NOTE_EXEC game pid=%d title=%s\n",
+                        (int)child_pid, title_id);
                 patch_game(child_pid, title_id);
             }
             child_pid = -1;
