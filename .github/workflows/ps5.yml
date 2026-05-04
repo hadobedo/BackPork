@@ -1,0 +1,62 @@
+name: PS5 Build
+
+on:
+  push:
+    paths-ignore:
+      - "**/*.md"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Payload
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout pacbrew-repo
+        uses: actions/checkout@v4
+        with:
+          repository: ps5-payload-dev/pacbrew-repo
+          path: pacbrew-repo
+
+      - name: Setup build environment
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            autoconf \
+            automake \
+            build-essential \
+            clang-18 \
+            git \
+            libarchive-tools \
+            libtool \
+            lld-18 \
+            makepkg \
+            meson \
+            pacman-package-manager \
+            pkg-config
+
+      - name: Build PS5 payload SDK
+        working-directory: pacbrew-repo/sdk
+        run: |
+          makepkg -c -f
+          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+
+      - name: Build payload
+        run: make clean all
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps5-backpork-${{ github.sha }}
+          path: ps5-backpork.elf
+          if-no-files-found: error
