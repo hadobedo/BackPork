@@ -11,15 +11,13 @@
 #include <stdarg.h>
 
 #include <sys/event.h>
+#include <fcntl.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysctl.h>
 #include <sys/user.h>
 
-
-#define IOVEC_ENTRY(x) {x ? (char *)x : 0, x ? strlen(x) + 1 : 0}
-#define IOVEC_SIZE(x) (sizeof(x) / sizeof(struct iovec))
 
 #define PAYLOAD_NAME "backpork.elf"
 #define LOG_DIR "/data/backpork"
@@ -58,7 +56,6 @@ typedef struct active_fakelib_mount {
     bool valid;
     bool mounted;
     bool unmounted_for_rest;
-    bool terminated_for_rest;
     pid_t pid;
     char title_id[10];
     char sandbox_id[14];
@@ -141,10 +138,11 @@ static void clear_active_mount(void) {
 
 static void remember_active_mount(pid_t pid, const char *title_id,
                                   const char *sandbox_id,
-                                  const char *mount_path) {
+                                  const char *mount_path,
+                                  bool mounted) {
     clear_active_mount();
     g_active_mount.valid = true;
-    g_active_mount.mounted = true;
+    g_active_mount.mounted = mounted;
     g_active_mount.pid = pid;
     snprintf(g_active_mount.title_id, sizeof(g_active_mount.title_id), "%s",
              title_id ? title_id : "");
@@ -181,32 +179,6 @@ static void unmount_active_fakelib_for_rest(unsigned state) {
             g_active_mount.mount_path, err, strerror(err));
 }
 
-static void terminate_active_game_for_rest(unsigned state) {
-    if (!g_active_mount.valid || g_active_mount.pid <= 0) {
-        return;
-    }
-
-    if (g_active_mount.terminated_for_rest) {
-        return;
-    }
-
-    if (!is_process_alive(g_active_mount.pid)) {
-        log_msg("[POWER] active game already gone before rest termination: pid=%d title=%s\n",
-                (int)g_active_mount.pid, g_active_mount.title_id);
-        g_active_mount.terminated_for_rest = true;
-        return;
-    }
-
-    log_msg("[POWER] terminating active backported game before rest state %u: pid=%d title=%s sandbox=%s\n",
-            state, (int)g_active_mount.pid, g_active_mount.title_id,
-            g_active_mount.sandbox_id);
-    if (kill(g_active_mount.pid, SIGKILL) != 0 && errno != ESRCH) {
-        log_msg("[WARNING] failed to terminate active game before rest: pid=%d errno=%d %s\n",
-                (int)g_active_mount.pid, errno, strerror(errno));
-    }
-    g_active_mount.terminated_for_rest = true;
-}
-
 static bool is_rest_state(unsigned state) {
     return state == SYSTEM_STATE_POWER_SAVING ||
            state == SYSTEM_STATE_SUSPEND_ON_GOING ||
@@ -240,14 +212,10 @@ static void apply_system_state(unsigned state) {
         }
         g_power_paused = true;
         unmount_active_fakelib_for_rest(state);
-        terminate_active_game_for_rest(state);
         return;
     }
 
     if (state == SYSTEM_STATE_WORKING && g_power_paused) {
-        if (g_active_mount.terminated_for_rest) {
-            log_msg("[POWER] active game was terminated for rest; skipping wake remount\n");
-        }
         g_power_paused = false;
         g_last_resume_us = monotonic_time_us();
         log_msg("[POWER] resumed from system state %u, settling for %u ms\n",
@@ -521,33 +489,119 @@ static int cleanup_directory(const char *path) {
     return result;
 }
 
-static int mount2(const char *src, const char *dst, const char *type) {
-    if (should_defer_mount_work()) {
-        log_msg("[MOUNT] deferred mount2 type=%s src=%s dst=%s paused=%d settle=%d\n",
-                type, src, dst, g_power_paused ? 1 : 0,
-                in_resume_settle_window() ? 1 : 0);
-        errno = EINTR;
+static int copy_file(const char *src, const char *dst, mode_t mode) {
+    int in_fd = open(src, O_RDONLY);
+    if (in_fd < 0) {
+        log_msg("[COPY] open source failed src=%s errno=%d %s\n",
+                src, errno, strerror(errno));
         return -1;
     }
 
-    struct iovec iov[] = {
-        IOVEC_ENTRY("fstype"),
-        IOVEC_ENTRY(type),
-        IOVEC_ENTRY("from"),
-        IOVEC_ENTRY(src),
-        IOVEC_ENTRY("fspath"),
-        IOVEC_ENTRY(dst),
-    };
-
-    log_msg("[MOUNT] nmount type=%s src=%s dst=%s\n", type, src, dst);
-    int ret = nmount(iov, IOVEC_SIZE(iov), 0);
-    if (ret != 0) {
-        log_msg("[MOUNT] nmount failed type=%s src=%s dst=%s errno=%d %s\n",
-                type, src, dst, errno, strerror(errno));
-    } else {
-        log_msg("[MOUNT] nmount ok type=%s dst=%s\n", type, dst);
+    int out_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode & 0777);
+    if (out_fd < 0) {
+        log_msg("[COPY] open dest failed dst=%s errno=%d %s\n",
+                dst, errno, strerror(errno));
+        close(in_fd);
+        return -1;
     }
-    return ret;
+
+    char buf[16384];
+    int result = 0;
+    for (;;) {
+        ssize_t nread = read(in_fd, buf, sizeof(buf));
+        if (nread == 0) {
+            break;
+        }
+        if (nread < 0) {
+            log_msg("[COPY] read failed src=%s errno=%d %s\n",
+                    src, errno, strerror(errno));
+            result = -1;
+            break;
+        }
+
+        char *ptr = buf;
+        ssize_t remaining = nread;
+        while (remaining > 0) {
+            ssize_t nwritten = write(out_fd, ptr, remaining);
+            if (nwritten < 0) {
+                log_msg("[COPY] write failed dst=%s errno=%d %s\n",
+                        dst, errno, strerror(errno));
+                result = -1;
+                break;
+            }
+            ptr += nwritten;
+            remaining -= nwritten;
+        }
+        if (result != 0) {
+            break;
+        }
+    }
+
+    fsync(out_fd);
+    close(out_fd);
+    close(in_fd);
+    return result;
+}
+
+static int copy_directory_contents(const char *src_dir, const char *dst_dir) {
+    DIR *dir = opendir(src_dir);
+    if (!dir) {
+        log_msg("[COPY] opendir failed src=%s errno=%d %s\n",
+                src_dir, errno, strerror(errno));
+        return -1;
+    }
+
+    int result = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        char src_path[PATH_MAX];
+        char dst_path[PATH_MAX];
+        int src_len = snprintf(src_path, sizeof(src_path), "%s/%s",
+                               src_dir, entry->d_name);
+        int dst_len = snprintf(dst_path, sizeof(dst_path), "%s/%s",
+                               dst_dir, entry->d_name);
+        if (src_len < 0 || src_len >= sizeof(src_path) ||
+            dst_len < 0 || dst_len >= sizeof(dst_path)) {
+            log_msg("[COPY] path too long under src=%s dst=%s name=%s\n",
+                    src_dir, dst_dir, entry->d_name);
+            result = -1;
+            break;
+        }
+
+        struct stat st;
+        if (stat(src_path, &st) != 0) {
+            log_msg("[COPY] stat failed src=%s errno=%d %s\n",
+                    src_path, errno, strerror(errno));
+            result = -1;
+            break;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            if (mkdir(dst_path, st.st_mode & 0777) != 0 && errno != EEXIST) {
+                log_msg("[COPY] mkdir failed dst=%s errno=%d %s\n",
+                        dst_path, errno, strerror(errno));
+                result = -1;
+                break;
+            }
+            if (copy_directory_contents(src_path, dst_path) != 0) {
+                result = -1;
+                break;
+            }
+        } else if (S_ISREG(st.st_mode)) {
+            log_msg("[COPY] file %s -> %s\n", src_path, dst_path);
+            if (copy_file(src_path, dst_path, st.st_mode) != 0) {
+                result = -1;
+                break;
+            }
+        }
+    }
+
+    closedir(dir);
+    return result;
 }
 
 
@@ -582,16 +636,17 @@ static char *mount_fakelibs(const char *sandbox_id, const char *cwd, pid_t pid, 
         return NULL;
     }
 
-    int res = mount2(fake_path, fake_mount_path, "unionfs");
-    if (res != 0) {
-        log_msg("[WARNING] mount_unionfs failed: %d (errno: %d, %s)\n", res, errno, strerror(errno));
-        unmount(fake_mount_path, MNT_FORCE);
+    log_msg("[COPY] installing fakelibs from %s to %s\n",
+            fake_path, fake_mount_path);
+    if (copy_directory_contents(fake_path, fake_mount_path) != 0) {
+        log_msg("[WARNING] fakelib copy failed from %s to %s\n",
+                fake_path, fake_mount_path);
         free(fake_mount_path);
         return NULL;
     }
 
-    log_msg("[INFO] Mounted fakelibs from %s to %s\n", fake_path, fake_mount_path);
-    log_msg("[PATCH] fakelib mounted source=%s target=%s\n", fake_path, fake_mount_path);
+    log_msg("[INFO] Installed fakelibs from %s to %s without unionfs\n",
+            fake_path, fake_mount_path);
     return fake_mount_path;
 }
 
@@ -783,8 +838,10 @@ static void cleanup_game(pid_t pid, const char *sandbox_id, char *fake_mount_pat
         if (unmount(fake_mount_path, 0) != 0 && errno != ENOENT && errno != EINVAL) {
             log_msg("[WARNING] Failed to unmount %s: %s\n", fake_mount_path, strerror(errno));
         }
-    } else {
+    } else if (tracked_mount && g_active_mount.unmounted_for_rest) {
         log_msg("[INFO] Fakelib already unmounted for rest: %s\n", fake_mount_path);
+    } else {
+        log_msg("[INFO] No fakelib mount to unmount: %s\n", fake_mount_path);
     }
     if (tracked_mount) {
         g_active_mount.mounted = false;
@@ -861,7 +918,7 @@ static void patch_game(pid_t child_pid, const char *title_id) {
     char* fake_mount_path = mount_fakelibs(sandbox_id, src_path, child_pid, random_folder);
 
     if (fake_mount_path) {
-        remember_active_mount(child_pid, title_id, sandbox_id, fake_mount_path);
+        remember_active_mount(child_pid, title_id, sandbox_id, fake_mount_path, false);
 		notify("Patch successful. Waiting for game to exit...");
         log_msg("[INFO] Patch successful. Waiting for game to exit...\n");
         if (wait_for_pid_exit(child_pid)) {
