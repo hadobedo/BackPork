@@ -30,6 +30,7 @@
 #define REST_POLL_US 250000u
 #define GAME_SCAN_US 1000000ull
 #define HEARTBEAT_US 5000000ull
+#define SCAN_LOG_US 5000000ull
 
 typedef intptr_t backpork_event_flag_t;
 
@@ -343,11 +344,19 @@ static pid_t find_pid(const char *name) {
     return pid;
 }
 
-static bool get_game_title_id(pid_t pid, char *title_id, size_t title_id_size) {
+static bool get_game_title_id(pid_t pid, char *title_id, size_t title_id_size,
+                              bool *appinfo_ok) {
     app_info_t appinfo = {0};
     int rc = sceKernelGetAppInfo(pid, &appinfo);
     if (rc != 0) {
+        if (appinfo_ok) {
+            *appinfo_ok = false;
+        }
         return false;
+    }
+
+    if (appinfo_ok) {
+        *appinfo_ok = true;
     }
 
     if (title_id_size < 10) {
@@ -360,7 +369,7 @@ static bool get_game_title_id(pid_t pid, char *title_id, size_t title_id_size) {
 }
 
 static bool find_running_game(pid_t *game_pid, char *title_id,
-                              size_t title_id_size) {
+                              size_t title_id_size, bool verbose) {
     int mib[4] = {1, 14, 8, 0};
     pid_t mypid = getpid();
     size_t buf_size;
@@ -383,10 +392,15 @@ static bool find_running_game(pid_t *game_pid, char *title_id,
     }
 
     bool found = false;
+    int process_count = 0;
+    int appinfo_count = 0;
+    int sample_count = 0;
     for (uint8_t *ptr = buf; ptr < (buf + buf_size);) {
         int ki_structsize = *(int *)ptr;
         pid_t ki_pid = *(pid_t *)&ptr[72];
+        char *ki_tdname = (char *)&ptr[447];
         ptr += ki_structsize;
+        process_count++;
 
         if (ki_pid == mypid || ki_pid <= 0) {
             continue;
@@ -396,14 +410,28 @@ static bool find_running_game(pid_t *game_pid, char *title_id,
             continue;
         }
 
-        if (get_game_title_id(ki_pid, title_id, title_id_size)) {
+        if (verbose && sample_count < 12) {
+            log_msg("[SCAN] sample pid=%d name=%s\n", (int)ki_pid, ki_tdname);
+            sample_count++;
+        }
+
+        bool appinfo_ok = false;
+        if (get_game_title_id(ki_pid, title_id, title_id_size, &appinfo_ok)) {
             *game_pid = ki_pid;
             found = true;
             break;
         }
+        if (appinfo_ok) {
+            appinfo_count++;
+        }
     }
 
     free(buf);
+    if (verbose || found) {
+        log_msg("[SCAN] complete processes=%d appinfo_ok=%d found=%d pid=%d title=%s\n",
+                process_count, appinfo_count, found ? 1 : 0,
+                found ? (int)*game_pid : -1, found ? title_id : "");
+    }
     return found;
 }
 
@@ -873,6 +901,7 @@ int main() {
     pid_t child_pid = -1;
     uint64_t last_scan_us = 0;
     uint64_t last_heartbeat_us = 0;
+    uint64_t last_scan_log_us = 0;
 
     while (!g_stop_requested) {
         poll_power_state();
@@ -893,7 +922,14 @@ int main() {
             !g_active_mount.valid) {
             pid_t scan_pid = -1;
             char scan_title_id[10] = {0};
-            if (find_running_game(&scan_pid, scan_title_id, sizeof(scan_title_id))) {
+            bool verbose_scan =
+                now_us != 0 && now_us - last_scan_log_us >= SCAN_LOG_US;
+            if (verbose_scan) {
+                log_msg("[SCAN] begin process scan\n");
+                last_scan_log_us = now_us;
+            }
+            if (find_running_game(&scan_pid, scan_title_id, sizeof(scan_title_id),
+                                  verbose_scan)) {
                 log_msg("[SCAN] running game detected pid=%d title=%s\n",
                         (int)scan_pid, scan_title_id);
                 patch_game(scan_pid, scan_title_id);
@@ -926,7 +962,7 @@ int main() {
 
         if (event.fflags & NOTE_EXEC && child_pid != -1 && event.ident == child_pid) {
             char title_id[10] = {0};
-            if (!get_game_title_id(child_pid, title_id, sizeof(title_id))) {
+            if (!get_game_title_id(child_pid, title_id, sizeof(title_id), NULL)) {
                 log_msg("[EVENT] NOTE_EXEC ignored pid=%d no PPSA/CUSA title\n",
                         (int)child_pid);
                 child_pid = -1;
