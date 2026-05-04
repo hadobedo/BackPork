@@ -1,11 +1,16 @@
 #include <dirent.h>
+#include <errno.h>
 #include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <stdarg.h>
 
+#include <sys/event.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -17,6 +22,20 @@
 #define IOVEC_SIZE(x) (sizeof(x) / sizeof(struct iovec))
 
 #define PAYLOAD_NAME "backpork.elf"
+#define SHELLCORE_FLAG_WAITMODE_OR 2u
+#define SHELLCORE_FLAG_ALL_BITS UINT64_MAX
+#define RESUME_SETTLE_US 2000000ull
+#define REST_POLL_US 250000u
+
+typedef intptr_t backpork_event_flag_t;
+
+enum {
+    SYSTEM_STATE_SHUTDOWN_ON_GOING = 100u,
+    SYSTEM_STATE_POWER_SAVING = 200u,
+    SYSTEM_STATE_SUSPEND_ON_GOING = 300u,
+    SYSTEM_STATE_MAIN_ON_STANDBY = 500u,
+    SYSTEM_STATE_WORKING = 1000u,
+};
 
 typedef struct notify_request {
     char unused[45];
@@ -32,7 +51,18 @@ typedef struct app_info {
 
 extern int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
 extern int sceKernelGetAppInfo(pid_t pid, app_info_t *info);
+extern int sceKernelOpenEventFlag(backpork_event_flag_t *ef, const char *name);
+extern int sceKernelPollEventFlag(backpork_event_flag_t ef, uint64_t bit_pattern,
+                                  unsigned int wait_mode,
+                                  uint64_t *result_pattern);
+extern int sceKernelCloseEventFlag(backpork_event_flag_t ef);
 
+static backpork_event_flag_t g_system_state_flag = -1;
+static bool g_power_paused = false;
+static bool g_stop_requested = false;
+static bool g_have_system_state = false;
+static unsigned g_last_system_state = 0;
+static uint64_t g_last_resume_us = 0;
 static void notify(const char* fmt, ...) {
     notify_request_t req = {};
     va_list args;
@@ -40,6 +70,127 @@ static void notify(const char* fmt, ...) {
     vsnprintf(req.message, sizeof(req.message) - 1, fmt, args);
     va_end(args);
     sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
+}
+
+static uint64_t monotonic_time_us(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000ull);
+}
+
+static bool is_rest_state(unsigned state) {
+    return state == SYSTEM_STATE_POWER_SAVING ||
+           state == SYSTEM_STATE_SUSPEND_ON_GOING ||
+           state == SYSTEM_STATE_MAIN_ON_STANDBY;
+}
+
+static void apply_system_state(unsigned state) {
+    bool changed = !g_have_system_state || g_last_system_state != state;
+    unsigned previous_state = g_have_system_state ? g_last_system_state : 0;
+    g_have_system_state = true;
+    g_last_system_state = state;
+
+    if (state == SYSTEM_STATE_SHUTDOWN_ON_GOING) {
+        if (!g_stop_requested) {
+            printf("[POWER] shutdown in progress, stopping BackPork work\n");
+        }
+        g_stop_requested = true;
+        return;
+    }
+
+    if (is_rest_state(state)) {
+        if (!g_power_paused) {
+            printf("[POWER] pausing BackPork work for system state %u\n", state);
+        }
+        g_power_paused = true;
+        return;
+    }
+
+    if (state == SYSTEM_STATE_WORKING && g_power_paused) {
+        g_power_paused = false;
+        g_last_resume_us = monotonic_time_us();
+        printf("[POWER] resumed from system state %u, settling for %u ms\n",
+               previous_state, (unsigned)(RESUME_SETTLE_US / 1000ull));
+        return;
+    }
+
+    if (changed) {
+        printf("[POWER] system state %u\n", state);
+    }
+}
+
+static void poll_power_state(void) {
+    if (g_system_state_flag < 0) {
+        return;
+    }
+
+    uint64_t pattern = 0;
+    int rc = sceKernelPollEventFlag(g_system_state_flag, SHELLCORE_FLAG_ALL_BITS,
+                                    SHELLCORE_FLAG_WAITMODE_OR, &pattern);
+    if (rc < 0) {
+        return;
+    }
+
+    apply_system_state((unsigned)(pattern & 0xffffu));
+}
+
+static bool init_power_state_monitor(void) {
+    int rc = sceKernelOpenEventFlag(&g_system_state_flag, "SceSystemStateMgrInfo");
+    if (rc < 0) {
+        g_system_state_flag = -1;
+        printf("[WARNING] SceSystemStateMgrInfo unavailable: 0x%08X\n",
+               (unsigned)rc);
+        return false;
+    }
+
+    poll_power_state();
+    printf("[POWER] monitoring SceSystemStateMgrInfo\n");
+    return true;
+}
+
+static void shutdown_power_state_monitor(void) {
+    if (g_system_state_flag >= 0) {
+        sceKernelCloseEventFlag(g_system_state_flag);
+        g_system_state_flag = -1;
+    }
+}
+
+static bool in_resume_settle_window(void) {
+    poll_power_state();
+    if (g_last_resume_us == 0) {
+        return false;
+    }
+
+    uint64_t now_us = monotonic_time_us();
+    return now_us != 0 && now_us - g_last_resume_us < RESUME_SETTLE_US;
+}
+
+static bool should_pause_work(void) {
+    poll_power_state();
+    return g_stop_requested || g_power_paused;
+}
+
+static bool should_defer_mount_work(void) {
+    return should_pause_work() || in_resume_settle_window();
+}
+
+static bool wait_until_work_ready(void) {
+    while (should_defer_mount_work()) {
+        if (g_stop_requested) {
+            return false;
+        }
+        usleep(REST_POLL_US);
+    }
+    return true;
+}
+
+static bool is_process_alive(pid_t pid) {
+    if (kill(pid, 0) == 0) {
+        return true;
+    }
+    return errno != ESRCH;
 }
 
 // from john-tornblom
@@ -80,6 +231,11 @@ static pid_t find_pid(const char *name) {
 }
 
 static int cleanup_directory(const char *path) {
+    if (should_defer_mount_work()) {
+        errno = EINTR;
+        return -1;
+    }
+
     DIR *d = opendir(path);
     if (!d) {
         return -1;
@@ -125,6 +281,11 @@ static int cleanup_directory(const char *path) {
 }
 
 static int mount2(const char *src, const char *dst, const char *type) {
+    if (should_defer_mount_work()) {
+        errno = EINTR;
+        return -1;
+    }
+
     struct iovec iov[] = {
         IOVEC_ENTRY("fstype"),
         IOVEC_ENTRY(type),
@@ -139,6 +300,11 @@ static int mount2(const char *src, const char *dst, const char *type) {
 
 
 static char *mount_fakelibs(const char *sandbox_id, const char *cwd, pid_t pid, char *random_folder) {
+    (void)pid;
+    if (!wait_until_work_ready()) {
+        return NULL;
+    }
+
     char fake_path[PATH_MAX + 1];
     snprintf(fake_path, sizeof(fake_path), "%s/fakelib", cwd);
 
@@ -155,6 +321,11 @@ static char *mount_fakelibs(const char *sandbox_id, const char *cwd, pid_t pid, 
 
     snprintf(fake_mount_path, PATH_MAX + 1, "/mnt/sandbox/%s/%s/common/lib", sandbox_id, random_folder);
 
+    if (should_defer_mount_work()) {
+        free(fake_mount_path);
+        return NULL;
+    }
+
     int res = mount2(fake_path, fake_mount_path, "unionfs");
     if (res != 0) {
         printf("[WARNING] mount_unionfs failed: %d (errno: %d, %s)\n", res, errno, strerror(errno));
@@ -167,11 +338,15 @@ static char *mount_fakelibs(const char *sandbox_id, const char *cwd, pid_t pid, 
     return fake_mount_path;
 }
 
-static void wait_for_pid_exit(pid_t pid) {
+static bool wait_for_pid_exit(pid_t pid) {
     int kq = kqueue();
     if (kq == -1) {
         perror("kqueue");
-        return;
+        while (!g_stop_requested && is_process_alive(pid)) {
+            wait_until_work_ready();
+            usleep(REST_POLL_US);
+        }
+        return !g_stop_requested;
     }
 
     struct kevent kev;
@@ -181,32 +356,59 @@ static void wait_for_pid_exit(pid_t pid) {
     if (ret == -1) {
         printf("[WARNING] kevent registration failed for pid %d: %s\n", pid, strerror(errno));
         close(kq);
-        sleep(3);
-        return;
+        while (!g_stop_requested && is_process_alive(pid)) {
+            wait_until_work_ready();
+            usleep(REST_POLL_US);
+        }
+        return !g_stop_requested;
     }
 
     printf("[INFO] Waiting for pid %d to exit...\n", pid);
 
-    while (1) {
+    while (!g_stop_requested) {
+        if (should_defer_mount_work()) {
+            usleep(REST_POLL_US);
+            continue;
+        }
+
         struct kevent event;
-        int nev = kevent(kq, NULL, 0, &event, 1, NULL);
+        struct timespec timeout = {0, REST_POLL_US * 1000};
+        int nev = kevent(kq, NULL, 0, &event, 1, &timeout);
 
         if (nev < 0) {
             printf("[WARNING] kevent wait failed: %s\n", strerror(errno));
             close(kq);
-            return;
+            return !is_process_alive(pid);
         }
 
         if (nev > 0 && event.fflags & NOTE_EXIT) {
             printf("[INFO] Process %d exited\n", pid);
+            if (!wait_until_work_ready()) {
+                close(kq);
+                return false;
+            }
+            break;
+        }
+
+        if (!is_process_alive(pid)) {
+            printf("[INFO] Process %d is no longer alive\n", pid);
+            if (!wait_until_work_ready()) {
+                close(kq);
+                return false;
+            }
             break;
         }
     }
 
     close(kq);
+    return !g_stop_requested;
 }
 
 static int find_highest_sandbox_number(const char* title_id) {
+    if (should_defer_mount_work()) {
+        return -1;
+    }
+
     char base_path[PATH_MAX];
     int highest = -1;
 
@@ -225,6 +427,10 @@ static int find_highest_sandbox_number(const char* title_id) {
 }
 
 static char* find_random_folder(const char* title_id, int sandbox_num) {
+    if (should_defer_mount_work()) {
+        return NULL;
+    }
+
     char base_path[PATH_MAX];
     snprintf(base_path, sizeof(base_path), "/mnt/sandbox/%s_%03d", title_id, sandbox_num);
 
@@ -257,6 +463,7 @@ static char* find_random_folder(const char* title_id, int sandbox_num) {
 }
 
 static void cleanup_game(pid_t pid, const char *sandbox_id, char *fake_mount_path) {
+    (void)pid;
     // Wait for sandbox to be cleaned up by the system
     char sandbox_app0[PATH_MAX];
     snprintf(sandbox_app0, sizeof(sandbox_app0), "/mnt/sandbox/%s/app0", sandbox_id);
@@ -264,23 +471,43 @@ static void cleanup_game(pid_t pid, const char *sandbox_id, char *fake_mount_pat
 
     int wait_count = 0;
     struct stat sandbox_st;
-    while (stat(sandbox_app0, &sandbox_st) == 0 && wait_count < 30) {
-        sleep(1);
+    while (!g_stop_requested && stat(sandbox_app0, &sandbox_st) == 0 && wait_count < 30) {
+        if (should_defer_mount_work()) {
+            usleep(REST_POLL_US);
+            continue;
+        }
+        usleep(1000000);
         wait_count++;
         if (wait_count % 5 == 0) {
             printf("[DEBUG] Still waiting for sandbox cleanup... (%d seconds)\n", wait_count);
         }
     }
 
+    if (g_stop_requested) {
+        printf("[INFO] Stop requested, leaving fakelib mount untouched: %s\n", fake_mount_path);
+        free(fake_mount_path);
+        return;
+    }
+
     if (stat(sandbox_app0, &sandbox_st) == 0) {
-        printf("[WARNING] Sandbox still exists after 30 seconds, proceeding anyway\n");
+        printf("[WARNING] Sandbox still exists after 30 stable seconds, leaving cleanup to the system\n");
+        free(fake_mount_path);
+        return;
     } else {
         printf("[INFO] Sandbox cleaned up after %d seconds\n", wait_count);
     }
 
+    if (!wait_until_work_ready()) {
+        printf("[INFO] Stop requested before cleanup, leaving fakelib mount untouched: %s\n", fake_mount_path);
+        free(fake_mount_path);
+        return;
+    }
+
     // Unmount the fakelibs
     printf("[INFO] Unmounting %s\n", fake_mount_path);
-    unmount(fake_mount_path, 0);
+    if (unmount(fake_mount_path, 0) != 0 && errno != ENOENT && errno != EINVAL) {
+        printf("[WARNING] Failed to unmount %s: %s\n", fake_mount_path, strerror(errno));
+    }
 
     // Remove the entire sandbox directory
     char sandbox_dir[PATH_MAX];
@@ -298,6 +525,10 @@ static void cleanup_game(pid_t pid, const char *sandbox_id, char *fake_mount_pat
 }
 
 static void patch_game(pid_t child_pid, const char *title_id) {
+    if (!wait_until_work_ready()) {
+        return;
+    }
+
     // Find highest sandbox number
     int sandbox_num = find_highest_sandbox_number(title_id);
     if (sandbox_num == -1) {
@@ -314,6 +545,10 @@ static void patch_game(pid_t child_pid, const char *title_id) {
     snprintf(fakelib_src_path, sizeof(fakelib_src_path), "/mnt/sandbox/%s/app0/fakelib", sandbox_id);
     struct stat st;
     if (stat(fakelib_src_path, &st) != 0) {
+        return;
+    }
+
+    if (!wait_until_work_ready()) {
         return;
     }
 
@@ -335,8 +570,12 @@ static void patch_game(pid_t child_pid, const char *title_id) {
     if (fake_mount_path) {
 		notify("Patch successful. Waiting for game to exit...");
         printf("[INFO] Patch successful. Waiting for game to exit...\n");
-        wait_for_pid_exit(child_pid);
-        cleanup_game(child_pid, sandbox_id, fake_mount_path);
+        if (wait_for_pid_exit(child_pid)) {
+            cleanup_game(child_pid, sandbox_id, fake_mount_path);
+        } else {
+            printf("[INFO] Stop requested, leaving fakelib mount untouched: %s\n", fake_mount_path);
+            free(fake_mount_path);
+        }
     }
 
     free(random_folder);
@@ -377,14 +616,23 @@ int main() {
         return -1;
     }
 
+    init_power_state_monitor();
+
 	notify("Welcome To BackPork 0.1 By BestPig 🐷");
     printf("[INFO] Monitoring SceSysCore.elf (pid %d) for game launches...\n", syscore_pid);
 
     pid_t child_pid = -1;
 
-    while (1) {
+    while (!g_stop_requested) {
+        poll_power_state();
+        if (should_defer_mount_work()) {
+            usleep(REST_POLL_US);
+            continue;
+        }
+
         struct kevent event;
-        int nev = kevent(kq, NULL, 0, &event, 1, NULL);
+        struct timespec timeout = {0, REST_POLL_US * 1000};
+        int nev = kevent(kq, NULL, 0, &event, 1, &timeout);
 
         if (nev < 0) {
             perror("kevent");
@@ -413,11 +661,14 @@ int main() {
                 continue;
             }
 
-            patch_game(child_pid, title_id);
+            if (wait_until_work_ready()) {
+                patch_game(child_pid, title_id);
+            }
             child_pid = -1;
         }
     }
 
+    shutdown_power_state_monitor();
     close(kq);
     return 0;
 }
