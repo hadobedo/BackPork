@@ -49,6 +49,16 @@ typedef struct app_info {
     char unknown2[0x3c];
 } app_info_t;
 
+typedef struct active_fakelib_mount {
+    bool valid;
+    bool mounted;
+    bool unmounted_for_rest;
+    pid_t pid;
+    char title_id[10];
+    char sandbox_id[14];
+    char mount_path[PATH_MAX + 1];
+} active_fakelib_mount_t;
+
 extern int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
 extern int sceKernelGetAppInfo(pid_t pid, app_info_t *info);
 extern int sceKernelOpenEventFlag(backpork_event_flag_t *ef, const char *name);
@@ -63,6 +73,7 @@ static bool g_stop_requested = false;
 static bool g_have_system_state = false;
 static unsigned g_last_system_state = 0;
 static uint64_t g_last_resume_us = 0;
+static active_fakelib_mount_t g_active_mount = {0};
 static void notify(const char* fmt, ...) {
     notify_request_t req = {};
     va_list args;
@@ -78,6 +89,46 @@ static uint64_t monotonic_time_us(void) {
         return 0;
     }
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000ull);
+}
+
+static void clear_active_mount(void) {
+    memset(&g_active_mount, 0, sizeof(g_active_mount));
+}
+
+static void remember_active_mount(pid_t pid, const char *title_id,
+                                  const char *sandbox_id,
+                                  const char *mount_path) {
+    clear_active_mount();
+    g_active_mount.valid = true;
+    g_active_mount.mounted = true;
+    g_active_mount.pid = pid;
+    snprintf(g_active_mount.title_id, sizeof(g_active_mount.title_id), "%s",
+             title_id ? title_id : "");
+    snprintf(g_active_mount.sandbox_id, sizeof(g_active_mount.sandbox_id), "%s",
+             sandbox_id ? sandbox_id : "");
+    snprintf(g_active_mount.mount_path, sizeof(g_active_mount.mount_path), "%s",
+             mount_path ? mount_path : "");
+}
+
+static void unmount_active_fakelib_for_rest(unsigned state) {
+    if (!g_active_mount.valid || !g_active_mount.mounted ||
+        g_active_mount.mount_path[0] == '\0') {
+        return;
+    }
+
+    printf("[POWER] unmounting fakelib before rest state %u: %s\n", state,
+           g_active_mount.mount_path);
+    if (unmount(g_active_mount.mount_path, 0) == 0 || errno == ENOENT ||
+        errno == EINVAL) {
+        g_active_mount.mounted = false;
+        g_active_mount.unmounted_for_rest = true;
+        printf("[POWER] fakelib unmounted for rest: %s\n",
+               g_active_mount.mount_path);
+        return;
+    }
+
+    printf("[WARNING] fakelib rest unmount failed: %s: %s\n",
+           g_active_mount.mount_path, strerror(errno));
 }
 
 static bool is_rest_state(unsigned state) {
@@ -105,6 +156,7 @@ static void apply_system_state(unsigned state) {
             printf("[POWER] pausing BackPork work for system state %u\n", state);
         }
         g_power_paused = true;
+        unmount_active_fakelib_for_rest(state);
         return;
     }
 
@@ -464,6 +516,9 @@ static char* find_random_folder(const char* title_id, int sandbox_num) {
 
 static void cleanup_game(pid_t pid, const char *sandbox_id, char *fake_mount_path) {
     (void)pid;
+    bool tracked_mount =
+        g_active_mount.valid && strcmp(g_active_mount.mount_path, fake_mount_path) == 0;
+
     // Wait for sandbox to be cleaned up by the system
     char sandbox_app0[PATH_MAX];
     snprintf(sandbox_app0, sizeof(sandbox_app0), "/mnt/sandbox/%s/app0", sandbox_id);
@@ -504,9 +559,16 @@ static void cleanup_game(pid_t pid, const char *sandbox_id, char *fake_mount_pat
     }
 
     // Unmount the fakelibs
-    printf("[INFO] Unmounting %s\n", fake_mount_path);
-    if (unmount(fake_mount_path, 0) != 0 && errno != ENOENT && errno != EINVAL) {
-        printf("[WARNING] Failed to unmount %s: %s\n", fake_mount_path, strerror(errno));
+    if (!tracked_mount || g_active_mount.mounted) {
+        printf("[INFO] Unmounting %s\n", fake_mount_path);
+        if (unmount(fake_mount_path, 0) != 0 && errno != ENOENT && errno != EINVAL) {
+            printf("[WARNING] Failed to unmount %s: %s\n", fake_mount_path, strerror(errno));
+        }
+    } else {
+        printf("[INFO] Fakelib already unmounted for rest: %s\n", fake_mount_path);
+    }
+    if (tracked_mount) {
+        g_active_mount.mounted = false;
     }
 
     // Remove the entire sandbox directory
@@ -521,6 +583,9 @@ static void cleanup_game(pid_t pid, const char *sandbox_id, char *fake_mount_pat
     }
 
     free(fake_mount_path);
+    if (tracked_mount) {
+        clear_active_mount();
+    }
     printf("[INFO] Cleanup finished.\n");
 }
 
@@ -568,6 +633,7 @@ static void patch_game(pid_t child_pid, const char *title_id) {
     char* fake_mount_path = mount_fakelibs(sandbox_id, src_path, child_pid, random_folder);
 
     if (fake_mount_path) {
+        remember_active_mount(child_pid, title_id, sandbox_id, fake_mount_path);
 		notify("Patch successful. Waiting for game to exit...");
         printf("[INFO] Patch successful. Waiting for game to exit...\n");
         if (wait_for_pid_exit(child_pid)) {
@@ -575,6 +641,9 @@ static void patch_game(pid_t child_pid, const char *title_id) {
         } else {
             printf("[INFO] Stop requested, leaving fakelib mount untouched: %s\n", fake_mount_path);
             free(fake_mount_path);
+        }
+        if (g_active_mount.valid && g_active_mount.pid == child_pid) {
+            clear_active_mount();
         }
     }
 
