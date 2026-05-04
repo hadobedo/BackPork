@@ -22,6 +22,8 @@
 #define IOVEC_SIZE(x) (sizeof(x) / sizeof(struct iovec))
 
 #define PAYLOAD_NAME "backpork.elf"
+#define LOG_DIR "/data/backpork"
+#define LOG_FILE "/data/backpork/debug.log"
 #define SHELLCORE_FLAG_WAITMODE_OR 2u
 #define SHELLCORE_FLAG_ALL_BITS UINT64_MAX
 #define RESUME_SETTLE_US 2000000ull
@@ -72,8 +74,44 @@ static bool g_power_paused = false;
 static bool g_stop_requested = false;
 static bool g_have_system_state = false;
 static unsigned g_last_system_state = 0;
+static int g_last_power_poll_rc = 0;
+static bool g_have_power_poll_rc = false;
 static uint64_t g_last_resume_us = 0;
 static active_fakelib_mount_t g_active_mount = {0};
+static FILE *g_log_file = NULL;
+
+static void close_log_file(void) {
+    if (g_log_file) {
+        fclose(g_log_file);
+        g_log_file = NULL;
+    }
+}
+
+static void open_log_file(void) {
+    mkdir(LOG_DIR, 0777);
+    g_log_file = fopen(LOG_FILE, "a");
+    if (g_log_file) {
+        setvbuf(g_log_file, NULL, _IOLBF, 0);
+    }
+}
+
+static void log_msg(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+
+    if (!g_log_file) {
+        return;
+    }
+
+    va_start(args, fmt);
+    vfprintf(g_log_file, fmt, args);
+    va_end(args);
+    fflush(g_log_file);
+    fsync(fileno(g_log_file));
+}
+
 static void notify(const char* fmt, ...) {
     notify_request_t req = {};
     va_list args;
@@ -108,6 +146,9 @@ static void remember_active_mount(pid_t pid, const char *title_id,
              sandbox_id ? sandbox_id : "");
     snprintf(g_active_mount.mount_path, sizeof(g_active_mount.mount_path), "%s",
              mount_path ? mount_path : "");
+    log_msg("[STATE] active mount: pid=%d title=%s sandbox=%s path=%s\n",
+            (int)g_active_mount.pid, g_active_mount.title_id,
+            g_active_mount.sandbox_id, g_active_mount.mount_path);
 }
 
 static void unmount_active_fakelib_for_rest(unsigned state) {
@@ -116,19 +157,22 @@ static void unmount_active_fakelib_for_rest(unsigned state) {
         return;
     }
 
-    printf("[POWER] unmounting fakelib before rest state %u: %s\n", state,
-           g_active_mount.mount_path);
+    log_msg("[POWER] unmounting fakelib before rest state %u: pid=%d title=%s sandbox=%s path=%s\n",
+            state, (int)g_active_mount.pid, g_active_mount.title_id,
+            g_active_mount.sandbox_id, g_active_mount.mount_path);
     if (unmount(g_active_mount.mount_path, 0) == 0 || errno == ENOENT ||
         errno == EINVAL) {
         g_active_mount.mounted = false;
         g_active_mount.unmounted_for_rest = true;
-        printf("[POWER] fakelib unmounted for rest: %s\n",
-               g_active_mount.mount_path);
+        log_msg("[POWER] fakelib unmounted for rest: title=%s sandbox=%s path=%s\n",
+                g_active_mount.title_id, g_active_mount.sandbox_id,
+                g_active_mount.mount_path);
         return;
     }
 
-    printf("[WARNING] fakelib rest unmount failed: %s: %s\n",
-           g_active_mount.mount_path, strerror(errno));
+    int err = errno;
+    log_msg("[WARNING] fakelib rest unmount failed: %s errno=%d %s\n",
+            g_active_mount.mount_path, err, strerror(err));
 }
 
 static bool is_rest_state(unsigned state) {
@@ -143,9 +187,16 @@ static void apply_system_state(unsigned state) {
     g_have_system_state = true;
     g_last_system_state = state;
 
+    if (changed) {
+        log_msg("[POWER] state transition previous=%u current=%u paused=%d active_valid=%d active_mounted=%d active_unmounted_for_rest=%d\n",
+                previous_state, state, g_power_paused ? 1 : 0,
+                g_active_mount.valid ? 1 : 0, g_active_mount.mounted ? 1 : 0,
+                g_active_mount.unmounted_for_rest ? 1 : 0);
+    }
+
     if (state == SYSTEM_STATE_SHUTDOWN_ON_GOING) {
         if (!g_stop_requested) {
-            printf("[POWER] shutdown in progress, stopping BackPork work\n");
+            log_msg("[POWER] shutdown in progress, stopping BackPork work\n");
         }
         g_stop_requested = true;
         return;
@@ -153,7 +204,7 @@ static void apply_system_state(unsigned state) {
 
     if (is_rest_state(state)) {
         if (!g_power_paused) {
-            printf("[POWER] pausing BackPork work for system state %u\n", state);
+            log_msg("[POWER] pausing BackPork work for system state %u\n", state);
         }
         g_power_paused = true;
         unmount_active_fakelib_for_rest(state);
@@ -163,13 +214,13 @@ static void apply_system_state(unsigned state) {
     if (state == SYSTEM_STATE_WORKING && g_power_paused) {
         g_power_paused = false;
         g_last_resume_us = monotonic_time_us();
-        printf("[POWER] resumed from system state %u, settling for %u ms\n",
+        log_msg("[POWER] resumed from system state %u, settling for %u ms\n",
                previous_state, (unsigned)(RESUME_SETTLE_US / 1000ull));
         return;
     }
 
     if (changed) {
-        printf("[POWER] system state %u\n", state);
+        log_msg("[POWER] system state %u\n", state);
     }
 }
 
@@ -182,8 +233,16 @@ static void poll_power_state(void) {
     int rc = sceKernelPollEventFlag(g_system_state_flag, SHELLCORE_FLAG_ALL_BITS,
                                     SHELLCORE_FLAG_WAITMODE_OR, &pattern);
     if (rc < 0) {
+        if (!g_have_power_poll_rc || g_last_power_poll_rc != rc) {
+            log_msg("[POWER] poll failed: 0x%08X\n", (unsigned)rc);
+            g_have_power_poll_rc = true;
+            g_last_power_poll_rc = rc;
+        }
         return;
     }
+
+    g_have_power_poll_rc = true;
+    g_last_power_poll_rc = 0;
 
     apply_system_state((unsigned)(pattern & 0xffffu));
 }
@@ -192,13 +251,13 @@ static bool init_power_state_monitor(void) {
     int rc = sceKernelOpenEventFlag(&g_system_state_flag, "SceSystemStateMgrInfo");
     if (rc < 0) {
         g_system_state_flag = -1;
-        printf("[WARNING] SceSystemStateMgrInfo unavailable: 0x%08X\n",
+        log_msg("[WARNING] SceSystemStateMgrInfo unavailable: 0x%08X\n",
                (unsigned)rc);
         return false;
     }
 
     poll_power_state();
-    printf("[POWER] monitoring SceSystemStateMgrInfo\n");
+    log_msg("[POWER] monitoring SceSystemStateMgrInfo\n");
     return true;
 }
 
@@ -284,6 +343,9 @@ static pid_t find_pid(const char *name) {
 
 static int cleanup_directory(const char *path) {
     if (should_defer_mount_work()) {
+        log_msg("[CLEANUP] deferred directory cleanup path=%s paused=%d settle=%d\n",
+                path, g_power_paused ? 1 : 0,
+                in_resume_settle_window() ? 1 : 0);
         errno = EINTR;
         return -1;
     }
@@ -334,6 +396,9 @@ static int cleanup_directory(const char *path) {
 
 static int mount2(const char *src, const char *dst, const char *type) {
     if (should_defer_mount_work()) {
+        log_msg("[MOUNT] deferred mount2 type=%s src=%s dst=%s paused=%d settle=%d\n",
+                type, src, dst, g_power_paused ? 1 : 0,
+                in_resume_settle_window() ? 1 : 0);
         errno = EINTR;
         return -1;
     }
@@ -347,7 +412,15 @@ static int mount2(const char *src, const char *dst, const char *type) {
         IOVEC_ENTRY(dst),
     };
 
-    return nmount(iov, IOVEC_SIZE(iov), 0);
+    log_msg("[MOUNT] nmount type=%s src=%s dst=%s\n", type, src, dst);
+    int ret = nmount(iov, IOVEC_SIZE(iov), 0);
+    if (ret != 0) {
+        log_msg("[MOUNT] nmount failed type=%s src=%s dst=%s errno=%d %s\n",
+                type, src, dst, errno, strerror(errno));
+    } else {
+        log_msg("[MOUNT] nmount ok type=%s dst=%s\n", type, dst);
+    }
+    return ret;
 }
 
 
@@ -359,10 +432,12 @@ static char *mount_fakelibs(const char *sandbox_id, const char *cwd, pid_t pid, 
 
     char fake_path[PATH_MAX + 1];
     snprintf(fake_path, sizeof(fake_path), "%s/fakelib", cwd);
+    log_msg("[PATCH] fakelib check sandbox=%s cwd=%s fake=%s random=%s\n",
+            sandbox_id, cwd, fake_path, random_folder);
 
     struct stat st;
     if (stat(fake_path, &st) != 0) {
-        printf("[WARNING] stat on %s failed (errno: %d, %s)\n", fake_path, errno, strerror(errno));
+        log_msg("[WARNING] stat on %s failed (errno: %d, %s)\n", fake_path, errno, strerror(errno));
         return NULL;
     }
 
@@ -372,28 +447,32 @@ static char *mount_fakelibs(const char *sandbox_id, const char *cwd, pid_t pid, 
     }
 
     snprintf(fake_mount_path, PATH_MAX + 1, "/mnt/sandbox/%s/%s/common/lib", sandbox_id, random_folder);
+    log_msg("[PATCH] fakelib mount target=%s\n", fake_mount_path);
 
     if (should_defer_mount_work()) {
+        log_msg("[PATCH] deferred before fakelib mount target=%s\n", fake_mount_path);
         free(fake_mount_path);
         return NULL;
     }
 
     int res = mount2(fake_path, fake_mount_path, "unionfs");
     if (res != 0) {
-        printf("[WARNING] mount_unionfs failed: %d (errno: %d, %s)\n", res, errno, strerror(errno));
+        log_msg("[WARNING] mount_unionfs failed: %d (errno: %d, %s)\n", res, errno, strerror(errno));
         unmount(fake_mount_path, MNT_FORCE);
         free(fake_mount_path);
         return NULL;
     }
 
-    printf("[INFO] Mounted fakelibs from %s to %s\n", fake_path, fake_mount_path);
+    log_msg("[INFO] Mounted fakelibs from %s to %s\n", fake_path, fake_mount_path);
+    log_msg("[PATCH] fakelib mounted source=%s target=%s\n", fake_path, fake_mount_path);
     return fake_mount_path;
 }
 
 static bool wait_for_pid_exit(pid_t pid) {
     int kq = kqueue();
     if (kq == -1) {
-        perror("kqueue");
+        log_msg("[WARNING] kqueue failed while waiting for pid %d: %s\n",
+                pid, strerror(errno));
         while (!g_stop_requested && is_process_alive(pid)) {
             wait_until_work_ready();
             usleep(REST_POLL_US);
@@ -406,7 +485,7 @@ static bool wait_for_pid_exit(pid_t pid) {
 
     int ret = kevent(kq, &kev, 1, NULL, 0, NULL);
     if (ret == -1) {
-        printf("[WARNING] kevent registration failed for pid %d: %s\n", pid, strerror(errno));
+        log_msg("[WARNING] kevent registration failed for pid %d: %s\n", pid, strerror(errno));
         close(kq);
         while (!g_stop_requested && is_process_alive(pid)) {
             wait_until_work_ready();
@@ -415,26 +494,36 @@ static bool wait_for_pid_exit(pid_t pid) {
         return !g_stop_requested;
     }
 
-    printf("[INFO] Waiting for pid %d to exit...\n", pid);
+    log_msg("[WAIT] waiting for pid=%d active_valid=%d active_mounted=%d active_unmounted_for_rest=%d\n",
+            pid, g_active_mount.valid ? 1 : 0, g_active_mount.mounted ? 1 : 0,
+            g_active_mount.unmounted_for_rest ? 1 : 0);
+    bool logged_defer = false;
 
     while (!g_stop_requested) {
         if (should_defer_mount_work()) {
+            if (!logged_defer) {
+                log_msg("[WAIT] deferring pid wait pid=%d paused=%d settle=%d\n",
+                        pid, g_power_paused ? 1 : 0,
+                        in_resume_settle_window() ? 1 : 0);
+                logged_defer = true;
+            }
             usleep(REST_POLL_US);
             continue;
         }
+        logged_defer = false;
 
         struct kevent event;
         struct timespec timeout = {0, REST_POLL_US * 1000};
         int nev = kevent(kq, NULL, 0, &event, 1, &timeout);
 
         if (nev < 0) {
-            printf("[WARNING] kevent wait failed: %s\n", strerror(errno));
+            log_msg("[WARNING] kevent wait failed: %s\n", strerror(errno));
             close(kq);
             return !is_process_alive(pid);
         }
 
         if (nev > 0 && event.fflags & NOTE_EXIT) {
-            printf("[INFO] Process %d exited\n", pid);
+            log_msg("[INFO] Process %d exited\n", pid);
             if (!wait_until_work_ready()) {
                 close(kq);
                 return false;
@@ -443,7 +532,7 @@ static bool wait_for_pid_exit(pid_t pid) {
         }
 
         if (!is_process_alive(pid)) {
-            printf("[INFO] Process %d is no longer alive\n", pid);
+            log_msg("[INFO] Process %d is no longer alive\n", pid);
             if (!wait_until_work_ready()) {
                 close(kq);
                 return false;
@@ -488,7 +577,7 @@ static char* find_random_folder(const char* title_id, int sandbox_num) {
 
     DIR* dir = opendir(base_path);
     if (!dir) {
-        printf("[WARNING] Failed to open directory: %s\n", base_path);
+        log_msg("[WARNING] Failed to open directory: %s\n", base_path);
         return NULL;
     }
 
@@ -504,25 +593,28 @@ static char* find_random_folder(const char* title_id, int sandbox_num) {
         struct stat st;
         if (stat(full_path, &st) == 0 && S_ISDIR(st.st_mode)) {
             closedir(dir);
-            printf("[DEBUG] Found random folder: %s in sandbox %03d\n", entry->d_name, sandbox_num);
+            log_msg("[DEBUG] Found random folder: %s in sandbox %03d\n", entry->d_name, sandbox_num);
             return strdup(entry->d_name);
         }
     }
 
     closedir(dir);
-    printf("[WARNING] No random folder found in %s\n", base_path);
+    log_msg("[WARNING] No random folder found in %s\n", base_path);
     return NULL;
 }
 
 static void cleanup_game(pid_t pid, const char *sandbox_id, char *fake_mount_path) {
-    (void)pid;
     bool tracked_mount =
         g_active_mount.valid && strcmp(g_active_mount.mount_path, fake_mount_path) == 0;
+    log_msg("[CLEANUP] begin pid=%d sandbox=%s path=%s tracked=%d mounted=%d unmounted_for_rest=%d\n",
+            (int)pid, sandbox_id, fake_mount_path, tracked_mount ? 1 : 0,
+            g_active_mount.mounted ? 1 : 0,
+            g_active_mount.unmounted_for_rest ? 1 : 0);
 
     // Wait for sandbox to be cleaned up by the system
     char sandbox_app0[PATH_MAX];
     snprintf(sandbox_app0, sizeof(sandbox_app0), "/mnt/sandbox/%s/app0", sandbox_id);
-    printf("[INFO] Waiting for sandbox cleanup: %s\n", sandbox_app0);
+    log_msg("[INFO] Waiting for sandbox cleanup: %s\n", sandbox_app0);
 
     int wait_count = 0;
     struct stat sandbox_st;
@@ -534,38 +626,38 @@ static void cleanup_game(pid_t pid, const char *sandbox_id, char *fake_mount_pat
         usleep(1000000);
         wait_count++;
         if (wait_count % 5 == 0) {
-            printf("[DEBUG] Still waiting for sandbox cleanup... (%d seconds)\n", wait_count);
+            log_msg("[DEBUG] Still waiting for sandbox cleanup... (%d seconds)\n", wait_count);
         }
     }
 
     if (g_stop_requested) {
-        printf("[INFO] Stop requested, leaving fakelib mount untouched: %s\n", fake_mount_path);
+        log_msg("[INFO] Stop requested, leaving fakelib mount untouched: %s\n", fake_mount_path);
         free(fake_mount_path);
         return;
     }
 
     if (stat(sandbox_app0, &sandbox_st) == 0) {
-        printf("[WARNING] Sandbox still exists after 30 stable seconds, leaving cleanup to the system\n");
+        log_msg("[CLEANUP] sandbox still active after 30 stable seconds; skipping cleanup\n");
         free(fake_mount_path);
         return;
     } else {
-        printf("[INFO] Sandbox cleaned up after %d seconds\n", wait_count);
+        log_msg("[CLEANUP] sandbox app0 gone after %d seconds; cleanup may proceed\n", wait_count);
     }
 
     if (!wait_until_work_ready()) {
-        printf("[INFO] Stop requested before cleanup, leaving fakelib mount untouched: %s\n", fake_mount_path);
+        log_msg("[INFO] Stop requested before cleanup, leaving fakelib mount untouched: %s\n", fake_mount_path);
         free(fake_mount_path);
         return;
     }
 
     // Unmount the fakelibs
     if (!tracked_mount || g_active_mount.mounted) {
-        printf("[INFO] Unmounting %s\n", fake_mount_path);
+        log_msg("[INFO] Unmounting %s\n", fake_mount_path);
         if (unmount(fake_mount_path, 0) != 0 && errno != ENOENT && errno != EINVAL) {
-            printf("[WARNING] Failed to unmount %s: %s\n", fake_mount_path, strerror(errno));
+            log_msg("[WARNING] Failed to unmount %s: %s\n", fake_mount_path, strerror(errno));
         }
     } else {
-        printf("[INFO] Fakelib already unmounted for rest: %s\n", fake_mount_path);
+        log_msg("[INFO] Fakelib already unmounted for rest: %s\n", fake_mount_path);
     }
     if (tracked_mount) {
         g_active_mount.mounted = false;
@@ -574,42 +666,51 @@ static void cleanup_game(pid_t pid, const char *sandbox_id, char *fake_mount_pat
     // Remove the entire sandbox directory
     char sandbox_dir[PATH_MAX];
     snprintf(sandbox_dir, sizeof(sandbox_dir), "/mnt/sandbox/%s", sandbox_id);
-    printf("[INFO] Removing directory %s\n", sandbox_dir);
+    log_msg("[INFO] Removing directory %s\n", sandbox_dir);
     if (cleanup_directory(sandbox_dir) == 0) {
 		notify("Directory removed successfully.");
-        printf("[INFO] Directory removed successfully\n");
+        log_msg("[INFO] Directory removed successfully\n");
     } else {
-        printf("[WARNING] Failed to remove directory: %s\n", strerror(errno));
+        log_msg("[WARNING] Failed to remove directory: %s\n", strerror(errno));
     }
 
     free(fake_mount_path);
     if (tracked_mount) {
         clear_active_mount();
     }
-    printf("[INFO] Cleanup finished.\n");
+    log_msg("[INFO] Cleanup finished.\n");
 }
 
 static void patch_game(pid_t child_pid, const char *title_id) {
+    log_msg("[PATCH] begin pid=%d title=%s paused=%d settle=%d\n",
+            (int)child_pid, title_id, g_power_paused ? 1 : 0,
+            in_resume_settle_window() ? 1 : 0);
     if (!wait_until_work_ready()) {
+        log_msg("[PATCH] aborted before sandbox lookup pid=%d title=%s\n",
+                (int)child_pid, title_id);
         return;
     }
 
     // Find highest sandbox number
     int sandbox_num = find_highest_sandbox_number(title_id);
     if (sandbox_num == -1) {
-        printf("[WARNING] No sandbox found for %s\n", title_id);
+        log_msg("[WARNING] No sandbox found for %s\n", title_id);
         return;
     }
 
     // Build sandbox_id
     char sandbox_id[14];
     snprintf(sandbox_id, sizeof(sandbox_id), "%s_%03d", title_id, sandbox_num);
+    log_msg("[PATCH] sandbox selected title=%s sandbox_num=%d sandbox_id=%s\n",
+            title_id, sandbox_num, sandbox_id);
 
     // Check if fakelib exists
     char fakelib_src_path[PATH_MAX];
     snprintf(fakelib_src_path, sizeof(fakelib_src_path), "/mnt/sandbox/%s/app0/fakelib", sandbox_id);
     struct stat st;
     if (stat(fakelib_src_path, &st) != 0) {
+        log_msg("[PATCH] no fakelib path=%s errno=%d %s\n",
+                fakelib_src_path, errno, strerror(errno));
         return;
     }
 
@@ -620,12 +721,12 @@ static void patch_game(pid_t child_pid, const char *title_id) {
     // Find random folder
     char* random_folder = find_random_folder(title_id, sandbox_num);
     if (!random_folder) {
-        printf("[WARNING] Failed to find random folder for %s\n", title_id);
+        log_msg("[WARNING] Failed to find random folder for %s\n", title_id);
         return;
     }
 
 	notify("Detected game %s. Patching...", title_id);
-    printf("[INFO] Detected game %s (pid %d) in sandbox %s. Patching...\n", title_id, child_pid, sandbox_id);
+    log_msg("[INFO] Detected game %s (pid %d) in sandbox %s. Patching...\n", title_id, child_pid, sandbox_id);
 
     char src_path[PATH_MAX];
     snprintf(src_path, sizeof(src_path), "/mnt/sandbox/%s/app0", sandbox_id);
@@ -635,42 +736,53 @@ static void patch_game(pid_t child_pid, const char *title_id) {
     if (fake_mount_path) {
         remember_active_mount(child_pid, title_id, sandbox_id, fake_mount_path);
 		notify("Patch successful. Waiting for game to exit...");
-        printf("[INFO] Patch successful. Waiting for game to exit...\n");
+        log_msg("[INFO] Patch successful. Waiting for game to exit...\n");
         if (wait_for_pid_exit(child_pid)) {
             cleanup_game(child_pid, sandbox_id, fake_mount_path);
         } else {
-            printf("[INFO] Stop requested, leaving fakelib mount untouched: %s\n", fake_mount_path);
+            log_msg("[INFO] Stop requested, leaving fakelib mount untouched: %s\n", fake_mount_path);
             free(fake_mount_path);
         }
         if (g_active_mount.valid && g_active_mount.pid == child_pid) {
             clear_active_mount();
         }
+    } else {
+        log_msg("[PATCH] mount_fakelibs returned NULL pid=%d title=%s sandbox=%s\n",
+                (int)child_pid, title_id, sandbox_id);
     }
 
     free(random_folder);
 }
 
 int main() {
+    open_log_file();
+    log_msg("\n========== BackPork debug build start %s pid=%d ==========\n",
+            __DATE__ " " __TIME__, (int)getpid());
     syscall(SYS_thr_set_name, -1, PAYLOAD_NAME);
 
     int pid;
     while ((pid = find_pid(PAYLOAD_NAME)) > 0) {
         if (kill(pid, SIGKILL)) {
+            log_msg("[WARNING] Failed to kill old instance pid=%d: %s\n",
+                    pid, strerror(errno));
+            close_log_file();
             return -1;
         }
-        printf("[INFO] Killed old instance\n");
+        log_msg("[INFO] Killed old instance\n");
         sleep(1);
     }
 
     pid_t syscore_pid = find_pid("SceSysCore.elf");
     if (syscore_pid == -1) {
-        printf("[WARNING] Failed to find SceSysCore.elf pid\n");
+        log_msg("[WARNING] Failed to find SceSysCore.elf pid\n");
+        close_log_file();
         return -1;
     }
 
     int kq = kqueue();
     if (kq == -1) {
-        perror("kqueue");
+        log_msg("[WARNING] kqueue failed for syscore monitor: %s\n", strerror(errno));
+        close_log_file();
         return -1;
     }
 
@@ -680,15 +792,17 @@ int main() {
 
     int ret = kevent(kq, &kev, 1, NULL, 0, NULL);
     if (ret == -1) {
-        perror("kevent");
+        log_msg("[WARNING] kevent registration failed for syscore pid %d: %s\n",
+                syscore_pid, strerror(errno));
         close(kq);
+        close_log_file();
         return -1;
     }
 
     init_power_state_monitor();
 
 	notify("Welcome To BackPork 0.1 By BestPig 🐷");
-    printf("[INFO] Monitoring SceSysCore.elf (pid %d) for game launches...\n", syscore_pid);
+    log_msg("[INFO] Monitoring SceSysCore.elf (pid %d) for game launches...\n", syscore_pid);
 
     pid_t child_pid = -1;
 
@@ -704,7 +818,7 @@ int main() {
         int nev = kevent(kq, NULL, 0, &event, 1, &timeout);
 
         if (nev < 0) {
-            perror("kevent");
+            log_msg("[WARNING] syscore kevent wait failed: %s\n", strerror(errno));
             continue;
         }
 
@@ -739,6 +853,8 @@ int main() {
 
     shutdown_power_state_monitor();
     close(kq);
+    log_msg("[INFO] BackPork exiting\n");
+    close_log_file();
     return 0;
 }
 
