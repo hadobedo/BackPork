@@ -80,6 +80,7 @@ static bool g_have_power_poll_rc = false;
 static uint64_t g_last_resume_us = 0;
 static active_fakelib_mount_t g_active_mount = {0};
 static FILE *g_log_file = NULL;
+static pid_t g_failed_patch_pid = -1;
 
 static bool is_process_alive(pid_t pid);
 
@@ -153,6 +154,13 @@ static void remember_active_mount(pid_t pid, const char *title_id,
     log_msg("[STATE] active mount: pid=%d title=%s sandbox=%s path=%s\n",
             (int)g_active_mount.pid, g_active_mount.title_id,
             g_active_mount.sandbox_id, g_active_mount.mount_path);
+}
+
+static void remember_failed_patch(pid_t pid, const char *title_id,
+                                  const char *sandbox_id) {
+    g_failed_patch_pid = pid;
+    log_msg("[PATCH] remembering failed patch pid=%d title=%s sandbox=%s; skipping retries for this process\n",
+            (int)pid, title_id ? title_id : "", sandbox_id ? sandbox_id : "");
 }
 
 static void unmount_active_fakelib_for_rest(unsigned state) {
@@ -404,6 +412,10 @@ static bool find_running_game(pid_t *game_pid, char *title_id,
         process_count++;
 
         if (ki_pid == mypid || ki_pid <= 0) {
+            continue;
+        }
+
+        if (g_failed_patch_pid == ki_pid) {
             continue;
         }
 
@@ -933,6 +945,7 @@ static void patch_game(pid_t child_pid, const char *title_id) {
     } else {
         log_msg("[PATCH] mount_fakelibs returned NULL pid=%d title=%s sandbox=%s\n",
                 (int)child_pid, title_id, sandbox_id);
+        remember_failed_patch(child_pid, title_id, sandbox_id);
     }
 
     free(random_folder);
