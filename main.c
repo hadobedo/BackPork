@@ -178,6 +178,45 @@ static void unmount_active_fakelib_for_rest(unsigned state) {
             g_active_mount.mount_path, err, strerror(err));
 }
 
+static void remount_active_fakelib_after_wake(unsigned previous_state) {
+    if (!g_active_mount.valid || g_active_mount.mounted ||
+        !g_active_mount.unmounted_for_rest ||
+        g_active_mount.mount_path[0] == '\0' ||
+        g_active_mount.sandbox_id[0] == '\0') {
+        return;
+    }
+
+    char fake_path[PATH_MAX + 1];
+    snprintf(fake_path, sizeof(fake_path), "/mnt/sandbox/%s/app0/fakelib",
+             g_active_mount.sandbox_id);
+
+    log_msg("[POWER] remounting fakelib after wake from state %u: pid=%d title=%s sandbox=%s src=%s dst=%s\n",
+            previous_state, (int)g_active_mount.pid, g_active_mount.title_id,
+            g_active_mount.sandbox_id, fake_path, g_active_mount.mount_path);
+
+    struct iovec iov[] = {
+        IOVEC_ENTRY("fstype"),
+        IOVEC_ENTRY("unionfs"),
+        IOVEC_ENTRY("from"),
+        IOVEC_ENTRY(fake_path),
+        IOVEC_ENTRY("fspath"),
+        IOVEC_ENTRY(g_active_mount.mount_path),
+    };
+
+    int ret = nmount(iov, IOVEC_SIZE(iov), 0);
+    if (ret == 0) {
+        g_active_mount.mounted = true;
+        g_active_mount.unmounted_for_rest = false;
+        log_msg("[POWER] fakelib remounted after wake: %s\n",
+                g_active_mount.mount_path);
+        return;
+    }
+
+    int err = errno;
+    log_msg("[WARNING] fakelib wake remount failed: src=%s dst=%s errno=%d %s\n",
+            fake_path, g_active_mount.mount_path, err, strerror(err));
+}
+
 static bool is_rest_state(unsigned state) {
     return state == SYSTEM_STATE_POWER_SAVING ||
            state == SYSTEM_STATE_SUSPEND_ON_GOING ||
@@ -215,6 +254,7 @@ static void apply_system_state(unsigned state) {
     }
 
     if (state == SYSTEM_STATE_WORKING && g_power_paused) {
+        remount_active_fakelib_after_wake(previous_state);
         g_power_paused = false;
         g_last_resume_us = monotonic_time_us();
         log_msg("[POWER] resumed from system state %u, settling for %u ms\n",
