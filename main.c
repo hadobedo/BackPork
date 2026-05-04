@@ -83,6 +83,8 @@ static uint64_t g_last_resume_us = 0;
 static active_fakelib_mount_t g_active_mount = {0};
 static FILE *g_log_file = NULL;
 
+static bool is_process_alive(pid_t pid);
+
 static void close_log_file(void) {
     if (g_log_file) {
         fclose(g_log_file);
@@ -186,6 +188,12 @@ static void remount_active_fakelib_after_wake(unsigned previous_state) {
         return;
     }
 
+    if (!is_process_alive(g_active_mount.pid)) {
+        log_msg("[POWER] skipping wake remount because active game is gone: pid=%d title=%s\n",
+                (int)g_active_mount.pid, g_active_mount.title_id);
+        return;
+    }
+
     char fake_path[PATH_MAX + 1];
     snprintf(fake_path, sizeof(fake_path), "/mnt/sandbox/%s/app0/fakelib",
              g_active_mount.sandbox_id);
@@ -215,6 +223,26 @@ static void remount_active_fakelib_after_wake(unsigned previous_state) {
     int err = errno;
     log_msg("[WARNING] fakelib wake remount failed: src=%s dst=%s errno=%d %s\n",
             fake_path, g_active_mount.mount_path, err, strerror(err));
+}
+
+static void terminate_active_game_for_rest(unsigned state) {
+    if (!g_active_mount.valid || g_active_mount.pid <= 0) {
+        return;
+    }
+
+    if (!is_process_alive(g_active_mount.pid)) {
+        log_msg("[POWER] active game already gone before rest termination: pid=%d title=%s\n",
+                (int)g_active_mount.pid, g_active_mount.title_id);
+        return;
+    }
+
+    log_msg("[POWER] terminating active backported game before rest state %u: pid=%d title=%s sandbox=%s\n",
+            state, (int)g_active_mount.pid, g_active_mount.title_id,
+            g_active_mount.sandbox_id);
+    if (kill(g_active_mount.pid, SIGKILL) != 0 && errno != ESRCH) {
+        log_msg("[WARNING] failed to terminate active game before rest: pid=%d errno=%d %s\n",
+                (int)g_active_mount.pid, errno, strerror(errno));
+    }
 }
 
 static bool is_rest_state(unsigned state) {
@@ -250,6 +278,7 @@ static void apply_system_state(unsigned state) {
         }
         g_power_paused = true;
         unmount_active_fakelib_for_rest(state);
+        terminate_active_game_for_rest(state);
         return;
     }
 
