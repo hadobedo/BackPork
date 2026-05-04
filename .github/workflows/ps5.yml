@@ -52,7 +52,7 @@ jobs:
           sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
 
       - name: Build payload
-        run: make clean all
+        run: make clean all PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
